@@ -1,319 +1,160 @@
-"""Agent 4: Candidate Transition and Sequence Feature Engineering.
+"""Agent 4: candidate-transition features (vectorised, pairwise).
 
-Features describing relationships between candidates across consecutive GPS
-observations.
+For every candidate c at observation i, every candidate p at the previous
+observation (the closest earlier observation that has candidates) forms a
+pair. Pair quantities are computed, then aggregated back to c.
 
-Key design decisions:
-- Uses actual road-network topology for connectivity checks.
-- Respects directed arcs (from_node -> to_node).
-- Geometric proximity is NOT treated as proof of connectivity.
-- Handles missing candidates and GPS timestamp gaps.
-- Avoids creating artificial transitions.
-- Does not use reference-route labels as transition features.
+Network distance from p to c is the shortest of:
+  * same arc            : along_c - along_p            (must be >= 0)
+  * directly connected  : (len_p - along_p) + along_c  (p.to == c.from)
+  * one intermediate arc: ... + len(m), m: p.to -> c.from
+Anything farther is left NaN ("not reachable within 2 hops"), never faked.
+The reference route is never used.
 """
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import pandas as pd
 
-from exploration.candidate_generation.geometry import haversine_distance_m
+from ._geo import circ_diff, haversine_np
+from .schema import validate_candidate_frame
+
+MAX_VEHICLE_SPEED_MPS = 80.0   # ~290 km/h; EDA shows legit 1 Hz steps up to ~72 m; implied speeds above are infeasible
+BACKWARD_TOLERANCE_M = 5.0     # GPS noise allowance for "moving backwards" on one arc
+
+TRANSITION_FEATURES = [
+    "transition_has_prev",
+    "transition_obs_gap",
+    "transition_num_prev_candidates",
+    "transition_proj_dist_min_m",
+    "transition_proj_speed_mps",
+    "transition_same_arc_as_prev",
+    "transition_connected_1hop",
+    "transition_reachable_2hop",
+    "transition_best_network_dist_m",
+    "transition_net_vs_gps_diff_m",
+    "transition_feasible",
+    "transition_num_feasible_prev",
+    "transition_seg_bearing_change_deg",
+]
 
 
-def _circular_bearing_diff(b1: float, b2: float) -> float:
-    """Circular difference between two bearings in degrees, in [-180, 180]."""
-    if math.isnan(b1) or math.isnan(b2):
-        return float("nan")
-    diff = (b2 - b1 + 180.0) % 360.0 - 180.0
-    return float(diff)
-
-
-def _safe_divide(numerator: float, denominator: float) -> float:
-    if denominator is None or denominator == 0.0 or math.isnan(denominator):
-        return float("nan")
-    return numerator / denominator
+def _arc_lengths(arcs_df: pd.DataFrame, nodes_df: pd.DataFrame) -> pd.DataFrame:
+    size = int(nodes_df.index.max()) + 1
+    lon = nodes_df["longitude"].reindex(range(size)).to_numpy(np.float64)
+    lat = nodes_df["latitude"].reindex(range(size)).to_numpy(np.float64)
+    f = arcs_df["from_node"].to_numpy(np.int64)
+    t = arcs_df["to_node"].to_numpy(np.int64)
+    ok = (f < size) & (t < size)
+    ln = np.full(len(f), np.nan)
+    ln[ok] = haversine_np(lat[f[ok]], lon[f[ok]], lat[t[ok]], lon[t[ok]])
+    tab = pd.DataFrame({"mid_from": f, "mid_to": t, "mid_len": ln}).dropna()
+    return tab.groupby(["mid_from", "mid_to"], as_index=False)["mid_len"].min()
 
 
 def compute_transition_features(
     df: pd.DataFrame,
     arcs_df: pd.DataFrame | None = None,
+    nodes_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Compute transition features for every observation-candidate pair.
+    validate_candidate_frame(df)
+    out = df.copy()
+    n = len(out)
+    res = {c: np.full(n, np.nan) for c in TRANSITION_FEATURES}
+    res["transition_has_prev"] = np.zeros(n)
+    res["transition_num_prev_candidates"] = np.zeros(n)
+    res["transition_num_feasible_prev"] = np.zeros(n)
+    if n == 0:
+        for c, v in res.items():
+            out[c] = v
+        return out
 
-    For each candidate at observation i, computes features describing the
-    transition from candidates at observation i-1. The transition features
-    are computed against the closest candidate from the previous observation
-    (by projected point distance), with aggregate statistics across all
-    previous-observation candidates also recorded.
+    cur = pd.DataFrame({
+        "row": np.arange(n),
+        "obs": out["observation_index"].to_numpy(np.int64),
+        "arc": out["arc_id"].to_numpy(np.int64),
+        "f": out["from_node_id"].to_numpy(np.int64),
+        "t": out["to_node_id"].to_numpy(np.int64),
+        "along": out["distance_along_segment_m"].to_numpy(np.float64),
+        "len": out["segment_length_m"].to_numpy(np.float64),
+        "plat": out["projected_latitude"].to_numpy(np.float64),
+        "plon": out["projected_longitude"].to_numpy(np.float64),
+        "glat": out["gps_latitude"].to_numpy(np.float64),
+        "glon": out["gps_longitude"].to_numpy(np.float64),
+        "ts": out["timestamp"].to_numpy(np.float64),
+        "sb": out["segment_bearing"].to_numpy(np.float64),
+    })
+    obs_sorted = np.sort(cur["obs"].unique())
+    prev_map = pd.Series(np.r_[np.nan, obs_sorted[:-1]], index=obs_sorted)
+    cur["prev_obs"] = cur["obs"].map(prev_map)
+    has_prev = cur["prev_obs"].notna()
+    res["transition_has_prev"] = has_prev.to_numpy(np.float64)
+    res["transition_obs_gap"] = (cur["obs"] - cur["prev_obs"]).to_numpy(np.float64)
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Candidate-level DataFrame sorted by observation_index. Must contain:
-        observation_index, timestamp, arc_id, from_node_id, to_node_id,
-        projected_longitude, projected_latitude, distance_along_segment_m,
-        segment_length_m, segment_bearing, gps_bearing, distance_m.
-    arcs_df : pd.DataFrame, optional
-        Road-network arcs with index = arc_id and columns from_node, to_node.
-        Used for connectivity checks between consecutive candidate arcs.
+    prv = cur.drop(columns=["prev_obs", "row"]).add_prefix("p_").rename(columns={"p_obs": "prev_obs"})
+    prv["prev_obs"] = prv["prev_obs"].astype(np.float64)
+    pairs = cur[has_prev].merge(prv, on="prev_obs", how="inner")
+    if not pairs.empty:
+        dt = pairs["ts"] - pairs["p_ts"]
+        proj = haversine_np(pairs["p_plat"], pairs["p_plon"], pairs["plat"], pairs["plon"])
+        gps = haversine_np(pairs["p_glat"], pairs["p_glon"], pairs["glat"], pairs["glon"])
+        rem_p = pairs["p_len"] - pairs["p_along"]
 
-    Returns
-    -------
-    pd.DataFrame
-        Copy of df with transition_* feature columns appended.
-    """
-    result = df.copy()
-    n = len(result)
+        same = pairs["arc"] == pairs["p_arc"]
+        d_same = pairs["along"] - pairs["p_along"]
+        d_same = d_same.where(same & (d_same >= -BACKWARD_TOLERANCE_M), np.nan).clip(lower=0.0)
+        adj = (pairs["p_t"] == pairs["f"]) & ~same
+        d_adj = (rem_p + pairs["along"]).where(adj, np.nan)
+        d_two = pd.Series(np.nan, index=pairs.index)
+        if arcs_df is not None and nodes_df is not None and not arcs_df.empty and not nodes_df.empty:
+            tab = _arc_lengths(arcs_df, nodes_df)
+            key = pairs[["p_t", "f"]].rename(columns={"p_t": "mid_from", "f": "mid_to"})
+            mid = key.merge(tab, on=["mid_from", "mid_to"], how="left")["mid_len"].to_numpy()
+            d_two = pd.Series(rem_p.to_numpy() + mid + pairs["along"].to_numpy(), index=pairs.index)
+            d_two = d_two.where(~same & ~adj, np.nan)
+        net = pd.concat([d_same, d_adj, d_two], axis=1).min(axis=1, skipna=True)
+        pairs["net"] = net
+        pairs["proj"] = proj
+        pairs["gps"] = gps
+        pairs["diff"] = (net - gps).abs()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pairs["speed"] = np.where(dt > 0, net / dt, np.nan)
+            pairs["pspeed"] = np.where(dt > 0, proj / dt, np.nan)
+        pairs["feasible"] = (net.notna() & ((pairs["speed"] <= MAX_VEHICLE_SPEED_MPS) | (dt <= 0))).astype(float)
+        pairs["same"] = same.astype(float)
+        pairs["conn1"] = (same & d_same.notna() | adj).astype(float)
+        pairs["reach"] = net.notna().astype(float)
+        pairs["bchg"] = np.abs(circ_diff(pairs["p_sb"], pairs["sb"]))
 
-    # Initialize feature columns with NaN.
-    feature_cols = {
-        "transition_dist_to_prev_projection_m": np.full(n, np.nan, dtype=np.float64),
-        "transition_time_diff_s": np.full(n, np.nan, dtype=np.float64),
-        "transition_implied_speed_mps": np.full(n, np.nan, dtype=np.float64),
-        "transition_candidate_bearing_diff_deg": np.full(n, np.nan, dtype=np.float64),
-        "transition_gps_bearing_diff_deg": np.full(n, np.nan, dtype=np.float64),
-        "transition_arcs_directly_connected": np.zeros(n, dtype=np.float64),
-        "transition_topologically_possible": np.zeros(n, dtype=np.float64),
-        "transition_network_distance_m": np.full(n, np.nan, dtype=np.float64),
-        "transition_network_vs_gps_diff_m": np.full(n, np.nan, dtype=np.float64),
-        "transition_feasibility_score": np.full(n, np.nan, dtype=np.float64),
-        "transition_candidate_continuity": np.full(n, np.nan, dtype=np.float64),
-        "transition_num_prev_candidates": np.full(n, np.nan, dtype=np.float64),
-        "transition_min_prev_dist_m": np.full(n, np.nan, dtype=np.float64),
-    }
-
-    required = [
-        "observation_index", "timestamp", "arc_id", "from_node_id", "to_node_id",
-        "projected_longitude", "projected_latitude", "distance_along_segment_m",
-        "segment_length_m", "segment_bearing", "gps_bearing", "distance_m",
-    ]
-    missing = [c for c in required if c not in result.columns]
-    if missing:
-        raise ValueError(f"Missing required columns for transition features: {missing}")
-
-    # Build arc connectivity map from arcs_df.
-    # arc_id -> set of to_node_ids of outgoing arcs from its to_node.
-    # Two arcs A (from->to) and B (from2->to2) are directly connected
-    # if A.to_node == B.from_node.
-    arc_to_node: dict[int, int] = {}
-    node_to_outgoing_arcs: dict[int, set[int]] = {}
-    if arcs_df is not None and not arcs_df.empty:
-        for aid, row in arcs_df.iterrows():
-            aid_int = int(aid)
-            fn = int(row["from_node"])
-            tn = int(row["to_node"])
-            arc_to_node[aid_int] = tn
-            node_to_outgoing_arcs.setdefault(fn, set()).add(aid_int)
-
-    # Group candidates by observation_index.
-    obs_to_rows: dict[int, list[int]] = {}
-    for i in range(n):
-        oi = int(result.iloc[i]["observation_index"])
-        obs_to_rows.setdefault(oi, []).append(i)
-
-    sorted_obs = sorted(obs_to_rows.keys())
-
-    # Precompute per-observation data.
-    obs_data: dict[int, dict] = {}
-    for oi in sorted_obs:
-        rows = obs_to_rows[oi]
-        obs_data[oi] = {
-            "row_indices": rows,
-            "timestamps": [float(result.iloc[r]["timestamp"]) for r in rows],
-            "projected_lons": [float(result.iloc[r]["projected_longitude"]) for r in rows],
-            "projected_lats": [float(result.iloc[r]["projected_latitude"]) for r in rows],
-            "arc_ids": [int(result.iloc[r]["arc_id"]) for r in rows],
-            "from_nodes": [int(result.iloc[r]["from_node_id"]) for r in rows],
-            "to_nodes": [int(result.iloc[r]["to_node_id"]) for r in rows],
-            "segment_bearings": [float(result.iloc[r]["segment_bearing"]) for r in rows],
-            "gps_bearings": [float(result.iloc[r]["gps_bearing"]) for r in rows],
-        }
-
-    # For each observation i > 0, compute transition features for each candidate
-    # based on the previous observation's candidates.
-    for obs_idx in sorted_obs[1:]:
-        prev_obs = sorted_obs[sorted_obs.index(obs_idx) - 1]
-
-        curr_data = obs_data[obs_idx]
-        prev_data = obs_data[prev_obs]
-
-        curr_ts = curr_data["timestamps"][0]
-        prev_ts = prev_data["timestamps"][0]
-        time_diff = curr_ts - prev_ts
-
-        num_prev = len(prev_data["row_indices"])
-
-        for j, curr_row in enumerate(curr_data["row_indices"]):
-            # Distance to closest previous projection.
-            min_prev_dist = float("inf")
-            best_prev_j = -1
-
-            curr_proj_lat = curr_data["projected_lats"][j]
-            curr_proj_lon = curr_data["projected_lons"][j]
-            curr_arc_id = curr_data["arc_ids"][j]
-            curr_from_node = curr_data["from_nodes"][j]
-            curr_to_node = curr_data["to_nodes"][j]
-            curr_seg_brg = curr_data["segment_bearings"][j]
-            curr_gps_brg = curr_data["gps_bearings"][j]
-            curr_dist_along = float(result.iloc[curr_row]["distance_along_segment_m"])
-            curr_seg_len = float(result.iloc[curr_row]["segment_length_m"])
-
-            # Transition features aggregated across all prev candidates.
-            all_prev_dists = []
-            all_prev_connected = []
-            all_prev_topological = []
-            all_prev_implied_speeds = []
-
-            for k in range(num_prev):
-                prev_proj_lat = prev_data["projected_lats"][k]
-                prev_proj_lon = prev_data["projected_lons"][k]
-                prev_arc_id = prev_data["arc_ids"][k]
-                prev_to_node = prev_data["to_nodes"][k]
-                prev_from_node = prev_data["from_nodes"][k]
-                prev_seg_brg = prev_data["segment_bearings"][k]
-                prev_gps_brg = prev_data["gps_bearings"][k]
-
-                # Projected point distance.
-                proj_dist = haversine_distance_m(
-                    prev_proj_lat, prev_proj_lon, curr_proj_lat, curr_proj_lon
-                )
-                all_prev_dists.append(proj_dist)
-
-                if proj_dist < min_prev_dist:
-                    min_prev_dist = proj_dist
-                    best_prev_j = k
-
-                # Direct connectivity: prev.to_node == curr.from_node.
-                directly_connected = 1.0 if prev_to_node == curr_from_node else 0.0
-                all_prev_connected.append(directly_connected)
-
-                # Topologically possible: there's an arc from prev.to_node
-                # to curr.from_node in the road network.
-                topological = 0.0
-                if prev_to_node in node_to_outgoing_arcs:
-                    # Check if any outgoing arc from prev.to_node leads to curr.from_node
-                    # OR if curr.from_node == prev.to_node (direct connection).
-                    if prev_to_node == curr_from_node:
-                        topological = 1.0
-                    else:
-                        # Check if there's an arc from prev.to_node that starts a path
-                        # to curr.from_node. For efficiency, just check one-hop.
-                        for next_aid in node_to_outgoing_arcs[prev_to_node]:
-                            if next_aid in arc_to_node and arc_to_node[next_aid] == curr_from_node:
-                                topological = 1.0
-                                break
-                all_prev_topological.append(topological)
-
-                # Implied speed between projections.
-                if time_diff > 0:
-                    implied_speed = proj_dist / time_diff
-                else:
-                    implied_speed = float("nan")
-                all_prev_implied_speeds.append(implied_speed)
-
-            # Best (closest) previous candidate features.
-            if best_prev_j >= 0:
-                feature_cols["transition_dist_to_prev_projection_m"][curr_row] = min_prev_dist
-                feature_cols["transition_num_prev_candidates"][curr_row] = float(num_prev)
-                feature_cols["transition_min_prev_dist_m"][curr_row] = min_prev_dist
-
-                # Time difference.
-                feature_cols["transition_time_diff_s"][curr_row] = time_diff
-
-                # Implied speed using closest projection.
-                if time_diff > 0 and not math.isnan(min_prev_dist):
-                    feature_cols["transition_implied_speed_mps"][curr_row] = min_prev_dist / time_diff
-
-                # Bearing differences.
-                prev_seg_brg = prev_data["segment_bearings"][best_prev_j]
-                prev_gps_brg = prev_data["gps_bearings"][best_prev_j]
-                feature_cols["transition_candidate_bearing_diff_deg"][curr_row] = _circular_bearing_diff(
-                    prev_seg_brg, curr_seg_brg
-                )
-                feature_cols["transition_gps_bearing_diff_deg"][curr_row] = _circular_bearing_diff(
-                    prev_gps_brg, curr_gps_brg
-                )
-
-                # Connectivity.
-                prev_to_node = prev_data["to_nodes"][best_prev_j]
-                feature_cols["transition_arcs_directly_connected"][curr_row] = (
-                    1.0 if prev_to_node == curr_from_node else 0.0
-                )
-
-                # Topological possibility.
-                topological = 0.0
-                if prev_to_node in node_to_outgoing_arcs:
-                    if prev_to_node == curr_from_node:
-                        topological = 1.0
-                    else:
-                        for next_aid in node_to_outgoing_arcs[prev_to_node]:
-                            if next_aid in arc_to_node and arc_to_node[next_aid] == curr_from_node:
-                                topological = 1.0
-                                break
-                feature_cols["transition_topologically_possible"][curr_row] = topological
-
-                # Network distance vs GPS displacement.
-                # Network distance = distance along prev segment to its end +
-                # distance along curr segment from its start (if directly connected).
-                if prev_to_node == curr_from_node:
-                    prev_dist_along = float(result.iloc[prev_data["row_indices"][best_prev_j]]["distance_along_segment_m"])
-                    prev_seg_len = float(result.iloc[prev_data["row_indices"][best_prev_j]]["segment_length_m"])
-                    network_dist = (prev_seg_len - prev_dist_along) + curr_dist_along
-                else:
-                    network_dist = float("nan")
-                feature_cols["transition_network_distance_m"][curr_row] = network_dist
-
-                if not math.isnan(network_dist) and not math.isnan(min_prev_dist):
-                    feature_cols["transition_network_vs_gps_diff_m"][curr_row] = abs(network_dist - min_prev_dist)
-
-                # Transition feasibility: high if directly connected, low implied speed,
-                # small bearing change.
-                bearing_change = abs(_circular_bearing_diff(prev_seg_brg, curr_seg_brg))
-                speed_ok = 1.0
-                if not math.isnan(min_prev_dist) and time_diff > 0:
-                    speed = min_prev_dist / time_diff
-                    if speed > 30.0:  # >108 km/h unrealistic
-                        speed_ok = 0.5
-                feat = 0.0
-                if prev_to_node == curr_from_node:
-                    feat += 0.5
-                feat += 0.3 * (1.0 - min(bearing_change / 180.0, 1.0))
-                feat += 0.2 * speed_ok
-                feature_cols["transition_feasibility_score"][curr_row] = feat
-
-                # Candidate continuity: relative positions along segments.
-                prev_rel_pos = _safe_divide(
-                    float(result.iloc[prev_data["row_indices"][best_prev_j]]["distance_along_segment_m"]),
-                    float(result.iloc[prev_data["row_indices"][best_prev_j]]["segment_length_m"]),
-                )
-                curr_rel_pos = _safe_divide(curr_dist_along, curr_seg_len)
-                if not (math.isnan(prev_rel_pos) or math.isnan(curr_rel_pos)):
-                    continuity = 1.0 - abs(curr_rel_pos - prev_rel_pos)
-                    feature_cols["transition_candidate_continuity"][curr_row] = continuity
-
-    # Append all feature columns.
-    for col, values in feature_cols.items():
-        result[col] = values
-
-    return result
+        g = pairs.groupby("row")
+        agg = g.agg(
+            n_prev=("proj", "size"), proj_min=("proj", "min"), same=("same", "max"),
+            conn1=("conn1", "max"), reach=("reach", "max"), feas=("feasible", "max"),
+            n_feas=("feasible", "sum"),
+        )
+        rows = agg.index.to_numpy()
+        res["transition_num_prev_candidates"][rows] = agg["n_prev"].to_numpy()
+        res["transition_proj_dist_min_m"][rows] = agg["proj_min"].to_numpy()
+        res["transition_same_arc_as_prev"][rows] = agg["same"].to_numpy()
+        res["transition_connected_1hop"][rows] = agg["conn1"].to_numpy()
+        res["transition_reachable_2hop"][rows] = agg["reach"].to_numpy()
+        res["transition_feasible"][rows] = agg["feas"].to_numpy()
+        res["transition_num_feasible_prev"][rows] = agg["n_feas"].to_numpy()
+        # speed of the projection-nearest previous candidate
+        near = pairs.sort_values(["row", "proj"], kind="stable").drop_duplicates("row")
+        res["transition_proj_speed_mps"][near["row"].to_numpy()] = near["pspeed"].to_numpy()
+        # best reachable pair: smallest |network - GPS displacement|
+        best = (pairs[pairs["net"].notna()].sort_values(["row", "diff"], kind="stable")
+                .drop_duplicates("row"))
+        r = best["row"].to_numpy()
+        res["transition_best_network_dist_m"][r] = best["net"].to_numpy()
+        res["transition_net_vs_gps_diff_m"][r] = best["diff"].to_numpy()
+        res["transition_seg_bearing_change_deg"][r] = best["bchg"].to_numpy()
+    for c, v in res.items():
+        out[c] = v
+    return out
 
 
 def get_transition_feature_names() -> list[str]:
-    """Return the list of transition feature column names."""
-    return [
-        "transition_dist_to_prev_projection_m",
-        "transition_time_diff_s",
-        "transition_implied_speed_mps",
-        "transition_candidate_bearing_diff_deg",
-        "transition_gps_bearing_diff_deg",
-        "transition_arcs_directly_connected",
-        "transition_topologically_possible",
-        "transition_network_distance_m",
-        "transition_network_vs_gps_diff_m",
-        "transition_feasibility_score",
-        "transition_candidate_continuity",
-        "transition_num_prev_candidates",
-        "transition_min_prev_dist_m",
-    ]
+    return list(TRANSITION_FEATURES)
