@@ -45,6 +45,67 @@ Each run:
 - `exploration/route_validation.py` — continuity checks and disconnection detection.
 - `exploration/visualize_route.py` — Folium visualisation and CLI entry point.
 
+### Dataset exploration & EDA (`exploration/eda.py`)
+
+The EDA component processes every trip in the ``train`` and ``student_test``
+splits and produces dataset-wide statistics, plots, interactive maps and a
+report under ``outputs/eda/``.
+
+```bash
+python -m exploration.eda
+```
+
+It computes:
+
+* Dataset inventory (trip counts, file presence, malformed records).
+* GPS trajectory analysis (intervals, speed, gaps, duplicates, outliers).
+* Road-network analysis (nodes/arcs, components, degree, self-loops, duplicates).
+* Reference-route analysis (length, repeats, continuity, disconnections).
+* GPS-to-road-network spatial analysis (KD-tree nearest-node distance).
+
+Outputs include five CSV summaries, ten Matplotlib plots, Folium maps for
+representative trips, and ``eda_report.md``.
+
+### Candidate generation (`exploration/candidate_generation/`)
+
+For every GPS observation, identifies nearby plausible road segments (arcs)
+from the road network using a KD-tree spatial index and exact point-to-segment
+distance calculations.
+
+```bash
+# Single trip
+python -m exploration.candidate_generation.candidate_generator --split train --trip 00000001
+python -m exploration.candidate_generation.candidate_generator --split student_test --trip 00000076
+
+# All trips in a split (writes aggregate statistics CSV)
+python -m exploration.candidate_generation.candidate_generator --split train --all-trips
+python -m exploration.candidate_generation.candidate_generator --split student_test --all-trips
+```
+
+Options:
+
+* ``--search-radius`` - search radius in metres (default: 50; try 25/50/75/100).
+* ``--max-candidates`` - max candidates per observation (default: 5).
+* ``--visualise`` - generate a Folium map.
+* ``--all-trips`` - process every trip in the split.
+
+It computes:
+
+* Point-to-segment distance (not just node distance) with segment projection.
+* GPS movement bearing and segment bearing.
+* Distance along segment from start node.
+* Per-trip miss rate, candidates per observation, and min/max candidates.
+
+Candidate generation depends only on GPS observations and the road network.
+Reference-route information is never used to generate candidates; it is used
+solely for evaluation on training trips (reference-arc coverage and observation
+reference coverage).
+
+Outputs per trip: ``candidates.csv`` and ``candidates.jsonl`` under
+``outputs/candidates/<split>/<trip_id>/``, plus optional Folium maps under
+``outputs/candidates/maps/<split>/``. Aggregate statistics are written to
+``outputs/candidates/candidate_statistics_<split>.csv``.
+
 ## Technology Stack
 
 - Python
