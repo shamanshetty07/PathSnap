@@ -31,3 +31,5 @@ artifacts/
 # Temporary files
 *.log
 *.tmp
+
+Data/
