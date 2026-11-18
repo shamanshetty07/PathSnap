@@ -1,6 +1,7 @@
 """PathSnap exploration package.
 
-Reference route reconstruction and visualisation components.
+Reference route reconstruction, visualisation and exploratory data analysis
+components.
 """
 
 from .data_loader import TripData, TripDataError, load_trip
@@ -24,4 +25,4 @@ __all__ = [
     "validate_route_references",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
