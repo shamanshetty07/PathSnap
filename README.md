@@ -17,6 +17,34 @@ PathSnap is a GPS map-matching project that identifies the most likely road segm
 9. Evaluation and visualisation
 10. FastAPI backend and Streamlit frontend
 
+## Reference Route Reconstruction & Visualisation (`exploration/`)
+
+The first implemented component loads a trip, reconstructs its reference route
+from the ordered arc IDs in `.route`, validates route continuity, and produces
+an interactive Folium map.
+
+### CLI usage
+
+```bash
+python -m exploration.visualize_route --split train --trip 00000001
+python -m exploration.visualize_route --split student_test --trip 00000076
+```
+
+Each run:
+
+1. Loads `.track`, `.nodes`, `.arcs` and `.route` for the selected trip.
+2. Reconstructs the reference route in arc order (repeated arc IDs preserved).
+3. Validates continuity and reports disconnected transitions.
+4. Saves an HTML map to `outputs/maps/<split>_<trip>_reference_route.html`.
+5. Prints a trip analysis summary.
+
+### Module layout
+
+- `exploration/data_loader.py` — loads and validates the four trip files.
+- `exploration/route_reconstruction.py` — builds the geographical route.
+- `exploration/route_validation.py` — continuity checks and disconnection detection.
+- `exploration/visualize_route.py` — Folium visualisation and CLI entry point.
+
 ## Technology Stack
 
 - Python
